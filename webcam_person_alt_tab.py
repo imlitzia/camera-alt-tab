@@ -1,13 +1,13 @@
-"""Detect a person with a webcam and press Alt+Tab on Windows.
+"""Detect a person and send a normal Alt+Tab on Windows.
 
 Install:
-    py -m pip install opencv-python
+    py -m pip install opencv-python ultralytics
 
 Run:
     py webcam_person_alt_tab.py
 
-Choose a detected camera when prompted, then switch to your game during the
-countdown. The program runs in the background without a preview by default.
+Choose a detected camera when prompted, then activate your game or any other
+application. Detection sends Alt+Tab to whichever application is active.
 """
 
 from __future__ import annotations
@@ -18,18 +18,16 @@ import platform
 import time
 
 import cv2
+from ultralytics import YOLO
 
 
-VK_MENU = 0x12  # Alt
+VK_MENU = 0x12
 VK_TAB = 0x09
 KEYEVENTF_KEYUP = 0x0002
 
 
 def press_alt_tab() -> None:
-    """Send one Alt+Tab key combination through the Windows API."""
-    if platform.system() != "Windows":
-        raise RuntimeError("Alt+Tab automation in this program requires Windows.")
-
+    """Send one normal Alt+Tab to the currently active application."""
     send_key = ctypes.windll.user32.keybd_event
     send_key(VK_MENU, 0, 0, 0)
     send_key(VK_TAB, 0, 0, 0)
@@ -39,7 +37,7 @@ def press_alt_tab() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Press Alt+Tab as soon as the webcam detects a person."
+        description="Send Alt+Tab when the webcam detects a person."
     )
     parser.add_argument(
         "--camera",
@@ -59,15 +57,15 @@ def parse_args() -> argparse.Namespace:
         help="Person must be absent this long before another trigger (default: 1)",
     )
     parser.add_argument(
-        "--startup-delay",
-        type=float,
-        default=5.0,
-        help="Seconds to wait so you can return to your game (default: 5)",
-    )
-    parser.add_argument(
         "--preview",
         action="store_true",
         help="Show the camera preview (this window can take focus)",
+    )
+    parser.add_argument(
+        "--confidence",
+        type=float,
+        default=0.35,
+        help="Minimum YOLO person confidence from 0 to 1 (default: 0.35)",
     )
     return parser.parse_args()
 
@@ -115,18 +113,15 @@ def main() -> None:
 
     camera_index = args.camera if args.camera is not None else choose_camera()
     camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not camera.isOpened():
         raise SystemExit(f"Could not open webcam {camera_index}.")
 
-    detector = cv2.HOGDescriptor()
-    detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    if not 0.0 < args.confidence <= 1.0:
+        raise SystemExit("--confidence must be greater than 0 and no more than 1.")
 
-    if args.startup_delay > 0:
-        print(f"\nSwitch to your game now. Detection starts in {args.startup_delay:g} seconds...")
-        time.sleep(args.startup_delay)
+    print("Loading YOLO person detector...")
+    detector = YOLO("yolov8n.pt")
 
     armed = True
     last_trigger = float("-inf")
@@ -143,16 +138,17 @@ def main() -> None:
                 time.sleep(0.02)
                 continue
 
-            # A smaller frame lowers detection latency while retaining enough detail.
-            scale = min(1.0, 640.0 / frame.shape[1])
-            scan = cv2.resize(frame, None, fx=scale, fy=scale)
-            boxes, _ = detector.detectMultiScale(
-                scan,
-                winStride=(8, 8),
-                padding=(8, 8),
-                scale=1.05,
-            )
-            person_found = len(boxes) > 0
+            # COCO class 0 is "person". The nano model is optimized for low-latency
+            # webcam inference and is much more reliable than Haar/HOG detection.
+            result = detector.predict(
+                source=frame,
+                classes=[0],
+                conf=args.confidence,
+                imgsz=640,
+                verbose=False,
+            )[0]
+            person_boxes = result.boxes
+            person_found = len(person_boxes) > 0
             now = time.monotonic()
 
             if person_found:
@@ -171,10 +167,11 @@ def main() -> None:
             if args.preview:
                 color = (0, 255, 0) if person_found else (0, 165, 255)
                 label = "PERSON DETECTED" if person_found else "Watching..."
-                cv2.putText(scan, label, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                for x, y, width, height in boxes:
-                    cv2.rectangle(scan, (x, y), (x + width, y + height), color, 2)
-                cv2.imshow("Person detector - Q to quit", scan)
+                cv2.putText(frame, label, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                if person_found:
+                    for x1, y1, x2, y2 in person_boxes.xyxy.cpu().numpy().astype(int):
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.imshow("Person detector - Q to quit", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     except KeyboardInterrupt:
