@@ -7,13 +7,17 @@ Run:
     py webcam_person_alt_tab.py
 
 Choose a detected camera when prompted, then activate your game or any other
-application. Detection sends Alt+Tab to whichever application is active.
+application. Draw a rectangle around the part of the camera image you want to
+monitor, then press Enter or Space. Detection sends Alt+Tab to whichever
+application is active.
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+from datetime import datetime
+from pathlib import Path
 import platform
 import time
 
@@ -67,6 +71,17 @@ def parse_args() -> argparse.Namespace:
         default=0.35,
         help="Minimum YOLO person confidence from 0 to 1 (default: 0.35)",
     )
+    parser.add_argument(
+        "--full-frame",
+        action="store_true",
+        help="Skip region selection and detect people in the entire camera frame",
+    )
+    parser.add_argument(
+        "--screenshot-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent / "detection_screenshots",
+        help="Folder for detection screenshots (default: detection_screenshots beside the script)",
+    )
     return parser.parse_args()
 
 
@@ -106,6 +121,92 @@ def choose_camera() -> int:
         print("That camera is unavailable. Choose a number from the list.")
 
 
+def select_detection_region(camera: cv2.VideoCapture) -> tuple[int, int, int, int]:
+    """Let the user draw the camera region in which people will be detected."""
+    frame = None
+    for _ in range(30):
+        ok, candidate = camera.read()
+        if ok:
+            frame = candidate
+        time.sleep(0.01)
+
+    if frame is None:
+        raise SystemExit("Could not read a frame for region selection.")
+
+    window_name = "Select detection area, then press Enter or Space"
+    print("\nDraw a box around the area to monitor.")
+    print("Press Enter or Space to confirm, or C to use the full camera frame.")
+    x, y, width, height = map(
+        int,
+        cv2.selectROI(window_name, frame, showCrosshair=True, fromCenter=False),
+    )
+    cv2.destroyWindow(window_name)
+
+    # selectROI returns a zero-sized rectangle when the selection is cancelled.
+    if width <= 0 or height <= 0:
+        frame_height, frame_width = frame.shape[:2]
+        print("No area selected; using the full camera frame.")
+        return 0, 0, frame_width, frame_height
+
+    print(f"Detection area selected: x={x}, y={y}, width={width}, height={height}")
+    return x, y, width, height
+
+
+def make_annotated_frame(
+    frame,
+    person_boxes,
+    detection_bounds: tuple[int, int, int, int],
+):
+    """Return a copy of the frame marked with the ROI and detected people."""
+    annotated = frame.copy()
+    x1, y1, x2, y2 = detection_bounds
+    color = (0, 255, 0)
+
+    cv2.putText(
+        annotated,
+        "PERSON DETECTED",
+        (15, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        color,
+        2,
+    )
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 255, 0), 2)
+    cv2.putText(
+        annotated,
+        "DETECTION AREA",
+        (x1 + 5, max(20, y1 + 25)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 0),
+        2,
+    )
+
+    for box_x1, box_y1, box_x2, box_y2 in person_boxes.xyxy.cpu().numpy().astype(int):
+        cv2.rectangle(
+            annotated,
+            (box_x1 + x1, box_y1 + y1),
+            (box_x2 + x1, box_y2 + y1),
+            color,
+            2,
+        )
+    return annotated
+
+
+def save_detection_screenshot(frame, screenshot_dir: Path) -> Path | None:
+    """Save a timestamped detection image and return its path if successful."""
+    try:
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        screenshot_path = screenshot_dir / f"person_detected_{timestamp}.jpg"
+        if cv2.imwrite(str(screenshot_path), frame):
+            return screenshot_path
+        print("Warning: OpenCV could not save the detection screenshot.")
+    except OSError as error:
+        print(f"Warning: Could not save detection screenshot: {error}")
+    return None
+
+
 def main() -> None:
     args = parse_args()
     if platform.system() != "Windows":
@@ -119,6 +220,17 @@ def main() -> None:
 
     if not 0.0 < args.confidence <= 1.0:
         raise SystemExit("--confidence must be greater than 0 and no more than 1.")
+
+    if args.full_frame:
+        ok, frame = camera.read()
+        if not ok:
+            raise SystemExit("Could not read a frame from the camera.")
+        frame_height, frame_width = frame.shape[:2]
+        detection_region = (0, 0, frame_width, frame_height)
+    else:
+        detection_region = select_detection_region(camera)
+
+    region_x, region_y, region_width, region_height = detection_region
 
     print("Loading YOLO person detector...")
     detector = YOLO("yolov8n.pt")
@@ -138,10 +250,16 @@ def main() -> None:
                 time.sleep(0.02)
                 continue
 
-            # COCO class 0 is "person". The nano model is optimized for low-latency
-            # webcam inference and is much more reliable than Haar/HOG detection.
+            frame_height, frame_width = frame.shape[:2]
+            x1 = max(0, min(region_x, frame_width - 1))
+            y1 = max(0, min(region_y, frame_height - 1))
+            x2 = max(x1 + 1, min(region_x + region_width, frame_width))
+            y2 = max(y1 + 1, min(region_y + region_height, frame_height))
+            detection_frame = frame[y1:y2, x1:x2]
+
+            # Run YOLO only inside the user-selected region. COCO class 0 is person.
             result = detector.predict(
-                source=frame,
+                source=detection_frame,
                 classes=[0],
                 conf=args.confidence,
                 imgsz=640,
@@ -150,14 +268,26 @@ def main() -> None:
             person_boxes = result.boxes
             person_found = len(person_boxes) > 0
             now = time.monotonic()
+            annotated_detection = None
 
             if person_found:
                 absent_since = None
                 if armed and now - last_trigger >= args.cooldown:
+                    annotated_detection = make_annotated_frame(
+                        frame,
+                        person_boxes,
+                        (x1, y1, x2, y2),
+                    )
+                    screenshot_path = save_detection_screenshot(
+                        annotated_detection,
+                        args.screenshot_dir,
+                    )
                     press_alt_tab()
                     last_trigger = now
                     armed = False
                     print("Person detected: Alt+Tab pressed.")
+                    if screenshot_path is not None:
+                        print(f"Screenshot saved: {screenshot_path}")
             else:
                 if absent_since is None:
                     absent_since = now
@@ -165,13 +295,28 @@ def main() -> None:
                     armed = True
 
             if args.preview:
-                color = (0, 255, 0) if person_found else (0, 165, 255)
-                label = "PERSON DETECTED" if person_found else "Watching..."
-                cv2.putText(frame, label, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
                 if person_found:
-                    for x1, y1, x2, y2 in person_boxes.xyxy.cpu().numpy().astype(int):
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.imshow("Person detector - Q to quit", frame)
+                    if annotated_detection is not None:
+                        preview_frame = annotated_detection
+                    else:
+                        preview_frame = make_annotated_frame(
+                            frame,
+                            person_boxes,
+                            (x1, y1, x2, y2),
+                        )
+                else:
+                    preview_frame = frame.copy()
+                    cv2.putText(
+                        preview_frame,
+                        "Watching...",
+                        (15, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 165, 255),
+                        2,
+                    )
+                    cv2.rectangle(preview_frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+                cv2.imshow("Person detector - Q to quit", preview_frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     except KeyboardInterrupt:
